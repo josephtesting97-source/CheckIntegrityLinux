@@ -57,6 +57,23 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
+def mb_to_bytes(value):
+    return value * 1024 * 1024
+
+
+def read_stream_limited(stream, max_bytes):
+    total = 0
+
+    while True:
+        chunk = stream.read(65536)
+        if not chunk:
+            return None
+
+        total += len(chunk)
+        if total > max_bytes:
+            return total
+
+
 def read_head(path, count):
     with open(path, "rb") as f:
         return f.read(count)
@@ -138,7 +155,7 @@ def test_magic_mismatch(path):
     return issues
 
 
-def test_zip(path):
+def test_zip(path, max_archive_read_bytes):
     issues = []
 
     try:
@@ -151,8 +168,17 @@ def test_zip(path):
             for name in names:
                 try:
                     with z.open(name) as f:
-                        while f.read(65536):
-                            pass
+                        bytes_read = read_stream_limited(
+                            f,
+                            max_archive_read_bytes,
+                        )
+
+                    if bytes_read is not None:
+                        issues.append(
+                            "zip entry exceeded "
+                            f"{max_archive_read_bytes // (1024 * 1024)}MB "
+                            f"read limit: {name}"
+                        )
                 except Exception as e:
                     issues.append(f"zip entry failed: {name}: {e}")
 
@@ -162,10 +188,10 @@ def test_zip(path):
     return issues
 
 
-def test_office(path):
+def test_office(path, max_archive_read_bytes):
     issues = []
 
-    issues.extend(test_zip(path))
+    issues.extend(test_zip(path, max_archive_read_bytes))
 
     if issues:
         return issues
@@ -257,11 +283,16 @@ def test_image(path):
         return [f"image decode failed: {e}"]
 
 
-def test_gzip(path):
+def test_gzip(path, max_archive_read_bytes):
     try:
         with gzip.open(path, "rb") as f:
-            while f.read(65536):
-                pass
+            bytes_read = read_stream_limited(f, max_archive_read_bytes)
+
+        if bytes_read is not None:
+            return [
+                "gzip stream exceeded "
+                f"{max_archive_read_bytes // (1024 * 1024)}MB read limit"
+            ]
 
         return []
 
@@ -352,16 +383,17 @@ def check_file(path, args):
     except Exception as e:
         issues.append(f"magic inspection failed: {e}")
 
-    if size <= args.max_deep_check_mb * 1024 * 1024:
+    if size <= mb_to_bytes(args.max_deep_check_mb):
 
         ext = path.suffix.lower()
+        max_archive_read_bytes = mb_to_bytes(args.max_archive_read_mb)
 
         try:
             if ext == ".zip":
-                issues.extend(test_zip(path))
+                issues.extend(test_zip(path, max_archive_read_bytes))
 
             elif ext in [".docx", ".xlsx", ".pptx"]:
-                issues.extend(test_office(path))
+                issues.extend(test_office(path, max_archive_read_bytes))
 
             elif ext == ".pdf":
                 issues.extend(test_pdf(path))
@@ -384,7 +416,7 @@ def check_file(path, args):
                 issues.extend(test_image(path))
 
             elif ext == ".gz":
-                issues.extend(test_gzip(path))
+                issues.extend(test_gzip(path, max_archive_read_bytes))
 
             elif ext in [".sqlite", ".sqlite3", ".db"]:
                 issues.extend(test_sqlite(path))
@@ -401,7 +433,7 @@ def check_file(path, args):
         try:
             sha = sha256_file(
                 path,
-                args.max_hash_mb * 1024 * 1024,
+                mb_to_bytes(args.max_hash_mb),
             )
         except Exception as e:
             suspicious.append(f"hash failed: {e}")
@@ -605,6 +637,16 @@ def main(argv=None):
         type=positive_int,
         default=2048,
         help="Skip SHA-256 hashing for files larger than this.",
+    )
+
+    parser.add_argument(
+        "--max-archive-read-mb",
+        type=positive_int,
+        default=1024,
+        help=(
+            "Stop validating an archive member or gzip stream after this "
+            "many decompressed MB."
+        ),
     )
 
     parser.add_argument(
