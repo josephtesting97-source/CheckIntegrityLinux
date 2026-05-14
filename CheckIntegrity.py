@@ -4,13 +4,11 @@ import argparse
 import csv
 import gzip
 import hashlib
-import io
 import json
 import os
 import sqlite3
 import struct
 import sys
-import traceback
 import zipfile
 from collections import Counter
 from datetime import datetime
@@ -24,7 +22,39 @@ except Exception:
     PIL_AVAILABLE = False
 
 
-MAX_HEADER = 32
+REPORT_FIELDS = [
+    "Status",
+    "Severity",
+    "Path",
+    "Extension",
+    "SizeBytes",
+    "LastWriteTime",
+    "Reason",
+    "Details",
+    "SHA256",
+]
+
+SUPPORTED_EXTENSIONS = {
+    ".bmp",
+    ".db",
+    ".docx",
+    ".gif",
+    ".gz",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".pdf",
+    ".png",
+    ".pptx",
+    ".sqlite",
+    ".sqlite3",
+    ".svg",
+    ".tif",
+    ".tiff",
+    ".xlsx",
+    ".xml",
+    ".zip",
+}
 
 
 def read_head(path, count):
@@ -273,7 +303,7 @@ def test_sqlite(path):
                 f"SQLite size not multiple of page size {page_size}"
             )
 
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
 
         try:
             cur = conn.execute("PRAGMA integrity_check;")
@@ -407,110 +437,203 @@ def check_file(path, args):
 
 
 def make_result(path, status, severity, reason, details, sha):
+    try:
+        stat = path.stat()
+        size = stat.st_size
+        last_write_time = datetime.fromtimestamp(stat.st_mtime).isoformat()
+    except OSError:
+        size = 0
+        last_write_time = ""
+
     return {
         "Status": status,
         "Severity": severity,
         "Path": str(path.resolve()),
         "Extension": path.suffix.lower(),
-        "SizeBytes": path.stat().st_size,
-        "LastWriteTime": datetime.fromtimestamp(
-            path.stat().st_mtime
-        ).isoformat(),
+        "SizeBytes": size,
+        "LastWriteTime": last_write_time,
         "Reason": reason,
         "Details": details,
         "SHA256": sha,
     }
 
 
-def gather_files(paths, include_hidden):
-    files = []
+def is_hidden(path):
+    return any(part.startswith(".") for part in path.parts)
+
+
+def gather_files(paths, include_hidden, recursive):
+    files = set()
+    warnings = []
 
     for p in paths:
         p = Path(p)
 
-        if p.is_file():
-            files.append(p)
+        try:
+            if p.is_file():
+                files.add(p)
+                continue
+
+            if not p.is_dir():
+                warnings.append(f"skipping missing path: {p}")
+                continue
+        except OSError as e:
+            warnings.append(f"could not inspect {p}: {e}")
             continue
 
-        if not p.is_dir():
-            continue
+        iterator = p.rglob("*") if recursive else p.iterdir()
 
-        # root files
-        for child in p.iterdir():
-            if child.is_file():
-                files.append(child)
+        try:
+            for child in iterator:
+                try:
+                    if child.is_symlink():
+                        continue
 
-        # immediate subfolders only
-        for child in p.iterdir():
-            if child.is_dir():
-                for sub in child.iterdir():
-                    if sub.is_file():
-                        files.append(sub)
+                    if not include_hidden and is_hidden(child.relative_to(p)):
+                        continue
 
-    out = []
+                    if child.is_file():
+                        files.add(child)
+                except OSError as e:
+                    warnings.append(f"could not inspect {child}: {e}")
+        except OSError as e:
+            warnings.append(f"could not read directory {p}: {e}")
 
-    for f in files:
-        if not include_hidden and f.name.startswith("."):
-            continue
-
-        out.append(f)
-
-    return sorted(set(out))
+    return sorted(files), warnings
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def normalize_extensions(extensions):
+    if not extensions:
+        return None
+
+    return {
+        x.lower() if x.startswith(".") else "." + x.lower()
+        for x in extensions
+    }
+
+
+def write_csv_report(path, results):
+    report_path = Path(path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with report_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
+        writer.writeheader()
+        writer.writerows(results)
+
+
+def write_json_report(path, results):
+    report_path = Path(path)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2)
+        f.write("\n")
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError("must be an integer") from e
+
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+
+    return parsed
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Check common Linux user files for obvious corruption by "
+            "validating headers and parsable file structures."
+        )
+    )
 
     parser.add_argument(
         "paths",
-        nargs="+",
+        nargs="*",
+        help="Files or directories to scan.",
     )
 
-    parser.add_argument("--csv")
-    parser.add_argument("--json-report")
+    parser.add_argument(
+        "--csv",
+        help="Write a CSV report to this path.",
+    )
+    parser.add_argument(
+        "--json-report",
+        help="Write a JSON report to this path.",
+    )
 
     parser.add_argument(
         "--include-hashes",
         action="store_true",
+        help="Include SHA-256 hashes for files up to --max-hash-mb.",
     )
 
     parser.add_argument(
         "--include-hidden",
         action="store_true",
+        help="Include hidden files and files inside hidden directories.",
+    )
+
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Only scan files directly inside supplied directories.",
     )
 
     parser.add_argument(
         "--extensions",
         nargs="*",
+        help=(
+            "Only scan these extensions. Values may be passed with or "
+            "without a leading dot, for example: pdf jpg zip."
+        ),
     )
 
     parser.add_argument(
         "--max-deep-check-mb",
-        type=int,
+        type=positive_int,
         default=512,
+        help="Skip format-specific deep checks for files larger than this.",
     )
 
     parser.add_argument(
         "--max-hash-mb",
-        type=int,
+        type=positive_int,
         default=2048,
+        help="Skip SHA-256 hashing for files larger than this.",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--supported-extensions",
+        action="store_true",
+        help="Print extensions with format-specific checks and exit.",
+    )
 
-    files = gather_files(
+    args = parser.parse_args(argv)
+
+    if args.supported_extensions:
+        for ext in sorted(SUPPORTED_EXTENSIONS):
+            print(ext)
+        return 0
+
+    if not args.paths:
+        parser.error("at least one path is required unless --supported-extensions is used")
+
+    files, warnings = gather_files(
         args.paths,
         args.include_hidden,
+        not args.no_recursive,
     )
 
-    if args.extensions:
-        exts = {
-            x.lower()
-            if x.startswith(".")
-            else "." + x.lower()
-            for x in args.extensions
-        }
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
 
+    exts = normalize_extensions(args.extensions)
+    if exts:
         files = [
             f for f in files
             if f.suffix.lower() in exts
@@ -559,24 +682,15 @@ def main():
         print("\nNo obvious corruption found.")
 
     if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=results[0].keys()
-                if results else [],
-            )
-
-            writer.writeheader()
-            writer.writerows(results)
-
+        write_csv_report(args.csv, results)
         print(f"\nCSV report: {args.csv}")
 
     if args.json_report:
-        with open(args.json_report, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2)
-
+        write_json_report(args.json_report, results)
         print(f"JSON report: {args.json_report}")
+
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
