@@ -7,6 +7,7 @@ pip install - r requirements.txt
 
 Scan common folders recursively:
 
+```bash
 python3 CheckIntegrity.py ~/Documents
 
 python3 CheckIntegrity.py ~/Desktop
@@ -14,7 +15,9 @@ python3 CheckIntegrity.py ~/Desktop
 python3 CheckIntegrity.py ~
 
 python3 CheckIntegrity.py ~/Downloads
+```
 
+Or scan them all at once
 
 ```bash
 python3 CheckIntegrity.py ~/Documents ~/Downloads ~/Pictures
